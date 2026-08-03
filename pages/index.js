@@ -5,6 +5,7 @@ import TabBar from "../components/TabBar";
 import Home from "../components/Home";
 import Translate from "../components/Translate";
 import GenericTool from "../components/GenericTool";
+import ChatBox from "../components/ChatBox";
 import { useApiKeys } from "../lib/useApiKeys";
 
 export default function IndexPage() {
@@ -39,14 +40,7 @@ export default function IndexPage() {
             activeKey={activeKey}
           />
         )}
-        {loaded && tab === "chat" && (
-          <GenericTool
-            modelId="chat"
-            placeholder="پیام خود را بنویسید..."
-            buttonLabel="ارسال"
-            activeKey={activeKey}
-          />
-        )}
+        {loaded && tab === "chat" && <ChatBox activeKey={activeKey} />}
         {loaded && tab === "text-classifier" && (
           <GenericTool
             modelId="text-classifier"
