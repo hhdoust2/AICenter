@@ -54,6 +54,7 @@ export default function Home({ activeKey }) {
   return (
     <div className="home-wrap">
       <div className="logo">Groq</div>
+      <p className="hero-tagline">پنج ابزار هوشمند — سریع، ساده و روان ✨</p>
 
       <div className="search-box glass">
         <input
