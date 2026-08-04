@@ -1,4 +1,5 @@
-import { getUsersCollection } from "../../lib/mongodb";
+import { readUsers, writeUsers } from "../../lib/githubStore";
+import { encrypt, decrypt } from "../../lib/crypto";
 import {
   sendMessage,
   editMessageText,
@@ -19,7 +20,7 @@ const LANGS = [
   { code: "tr", label: "ترکی" },
 ];
 
-const MAX_HISTORY = 12; // تعداد پیام‌های اخیر که برای حافظه چت نگه داشته می‌شود
+const MAX_HISTORY = 12;
 
 function maskKey(key) {
   if (!key) return "";
@@ -27,26 +28,35 @@ function maskKey(key) {
   return key.slice(0, 4) + "••••••••" + key.slice(-4);
 }
 
-async function getOrCreateUser(users, telegramId) {
-  let user = await users.findOne({ telegramId });
+function findOrCreateUser(users, telegramId) {
+  let user = users.find((u) => u.telegramId === telegramId);
   if (!user) {
     user = {
       telegramId,
-      apiKey: null,
+      apiKeyEnc: null, // کلید API به‌صورت رمزنگاری‌شده ذخیره می‌شود
       model: "base",
       state: null,
       pendingLang: null,
       history: [],
-      createdAt: new Date(),
+      createdAt: new Date().toISOString(),
     };
-    await users.insertOne(user);
+    users.push(user);
   }
   return user;
 }
 
-function modelKeyboard(prefix = "setmodel") {
+function getPlainKey(user) {
+  if (!user.apiKeyEnc) return null;
+  try {
+    return decrypt(user.apiKeyEnc);
+  } catch {
+    return null;
+  }
+}
+
+function modelKeyboard() {
   return inlineKeyboard(
-    MODELS.map((m) => [{ text: m.title, callback_data: `${prefix}:${m.id}` }])
+    MODELS.map((m) => [{ text: m.title, callback_data: `setmodel:${m.id}` }])
   );
 }
 
@@ -56,7 +66,7 @@ function langKeyboard() {
   ]);
 }
 
-async function handleCommand(users, user, chatId, text) {
+async function handleCommand(user, chatId, text) {
   const [cmd, ...rest] = text.trim().split(/\s+/);
   const arg = rest.join(" ");
 
@@ -65,13 +75,13 @@ async function handleCommand(users, user, chatId, text) {
       chatId,
       "سلام 👋\n" +
         "به ربات هوش مصنوعی Groq خوش آمدید.\n\n" +
-        "برای استفاده، ابتدا کلید API خودتان را از https://console.groq.com بگیرید و با دستور زیر ثبت کنید:\n" +
+        "ابتدا کلید API خودتان را از https://console.groq.com بگیرید و ثبت کنید:\n" +
         "<code>/setkey YOUR_API_KEY</code>\n\n" +
         "دستورات:\n" +
         "/setkey [کلید] - ثبت کلید API\n" +
         "/mykey - نمایش کلید فعلی (پوشیده)\n" +
         "/deletekey - حذف کلید\n" +
-        "/model - انتخاب ابزار فعال (Base, Translator, Summarizer, Chat, Classifier)\n" +
+        "/model - انتخاب ابزار فعال\n" +
         "/translate - ترجمه متن یا فایل\n" +
         "/reset - پاک‌کردن حافظه گفتگوی چت\n\n" +
         "بعد از ثبت کلید و انتخاب مدل، کافیست پیام متنی یا فایل بفرستید."
@@ -81,26 +91,24 @@ async function handleCommand(users, user, chatId, text) {
 
   if (cmd === "/setkey") {
     if (arg) {
-      await users.updateOne({ telegramId: user.telegramId }, { $set: { apiKey: arg, state: null } });
+      user.apiKeyEnc = encrypt(arg);
+      user.state = null;
       await sendMessage(chatId, "✅ کلید API با موفقیت ثبت شد: " + maskKey(arg));
     } else {
-      await users.updateOne({ telegramId: user.telegramId }, { $set: { state: "awaiting_key" } });
+      user.state = "awaiting_key";
       await sendMessage(chatId, "کلید API خود را در پیام بعدی ارسال کنید:");
     }
     return;
   }
 
   if (cmd === "/mykey") {
-    if (user.apiKey) {
-      await sendMessage(chatId, "کلید فعلی شما: " + maskKey(user.apiKey));
-    } else {
-      await sendMessage(chatId, "هنوز کلیدی ثبت نکرده‌اید. از /setkey استفاده کنید.");
-    }
+    const plain = getPlainKey(user);
+    await sendMessage(chatId, plain ? "کلید فعلی شما: " + maskKey(plain) : "هنوز کلیدی ثبت نکرده‌اید. از /setkey استفاده کنید.");
     return;
   }
 
   if (cmd === "/deletekey") {
-    await users.updateOne({ telegramId: user.telegramId }, { $set: { apiKey: null } });
+    user.apiKeyEnc = null;
     await sendMessage(chatId, "🗑 کلید API حذف شد.");
     return;
   }
@@ -116,7 +124,7 @@ async function handleCommand(users, user, chatId, text) {
   }
 
   if (cmd === "/reset") {
-    await users.updateOne({ telegramId: user.telegramId }, { $set: { history: [] } });
+    user.history = [];
     await sendMessage(chatId, "🧹 حافظه گفتگو پاک شد.");
     return;
   }
@@ -124,13 +132,14 @@ async function handleCommand(users, user, chatId, text) {
   await sendMessage(chatId, "دستور ناشناخته. برای راهنما /start را بفرستید.");
 }
 
-async function handleCallback(users, user, cq) {
+async function handleCallback(user, cq) {
   const chatId = cq.message.chat.id;
   const data = cq.data || "";
 
   if (data.startsWith("setmodel:")) {
     const modelId = data.split(":")[1];
-    await users.updateOne({ telegramId: user.telegramId }, { $set: { model: modelId, state: null } });
+    user.model = modelId;
+    user.state = null;
     const m = getModel(modelId);
     await answerCallbackQuery(cq.id, "انتخاب شد: " + m.title);
     await editMessageText(chatId, cq.message.message_id, `✅ ابزار فعال: <b>${m.title}</b>\n${m.desc}`);
@@ -139,10 +148,8 @@ async function handleCallback(users, user, cq) {
 
   if (data.startsWith("setlang:")) {
     const lang = data.split(":")[1];
-    await users.updateOne(
-      { telegramId: user.telegramId },
-      { $set: { state: "awaiting_translate_text", pendingLang: lang } }
-    );
+    user.state = "awaiting_translate_text";
+    user.pendingLang = lang;
     await answerCallbackQuery(cq.id, "زبان انتخاب شد");
     await editMessageText(chatId, cq.message.message_id, "✍️ حالا متن یا فایل موردنظر برای ترجمه را ارسال کنید.");
     return;
@@ -171,48 +178,46 @@ async function processWithProgress(chatId, task) {
   }
 }
 
-async function handleUserContent(users, user, chatId, userText) {
-  if (!user.apiKey) {
+async function handleUserContent(user, chatId, userText) {
+  const apiKey = getPlainKey(user);
+  if (!apiKey) {
     await sendMessage(chatId, "ابتدا با دستور /setkey کلید API خود را ثبت کنید.");
     return;
   }
   if (!userText || !userText.trim()) return;
 
-  // حالت در جریان: ترجمه
   if (user.state === "awaiting_translate_text") {
     const langLabel = LANGS.find((l) => l.code === user.pendingLang)?.label || "فارسی";
     const model = getModel("translator");
     const prompt = `Translate the following text to ${langLabel}. Only output the translation:\n\n${userText}`;
     try {
       const result = await processWithProgress(chatId, () =>
-        runGroq({ apiKey: user.apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, userText: prompt })
+        runGroq({ apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, userText: prompt })
       );
       await sendTextDocument(chatId, "translation.txt", result, "⬇ فایل ترجمه");
     } catch {}
-    await users.updateOne({ telegramId: user.telegramId }, { $set: { state: null, pendingLang: null } });
+    user.state = null;
+    user.pendingLang = null;
     return;
   }
 
   const activeModelId = user.model || "base";
   const model = getModel(activeModelId);
 
-  // حالت چت: حافظه مکالمه نگه داشته می‌شود
   if (activeModelId === "chat") {
     const history = [...(user.history || []), { role: "user", content: userText }];
     try {
       const result = await processWithProgress(chatId, () =>
-        runGroqChat({ apiKey: user.apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, history })
+        runGroqChat({ apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, history })
       );
-      const newHistory = [...history, { role: "assistant", content: result }].slice(-MAX_HISTORY);
-      await users.updateOne({ telegramId: user.telegramId }, { $set: { history: newHistory } });
+      user.history = [...history, { role: "assistant", content: result }].slice(-MAX_HISTORY);
     } catch {}
     return;
   }
 
-  // Base / Summarizer / Classifier: تک‌مرحله‌ای
   try {
     const result = await processWithProgress(chatId, () =>
-      runGroq({ apiKey: user.apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, userText })
+      runGroq({ apiKey, model: model.groqModel, systemPrompt: model.systemPrompt, userText })
     );
     if (activeModelId === "summarizer" || activeModelId === "text-classifier") {
       await sendTextDocument(chatId, `${activeModelId}-result.txt`, result, "⬇ فایل نتیجه");
@@ -232,45 +237,45 @@ export default async function handler(req, res) {
   res.status(200).send("ok"); // فوراً به تلگرام جواب می‌دهیم تا retry نکند
 
   try {
-    const users = await getUsersCollection();
+    // هر درخواست یک بار کل فایل کاربران را از ریپازیتوری داده می‌خواند،
+    // در حافظه تغییر می‌دهد، و در پایان یک بار (یک commit) می‌نویسد.
+    const { users, sha } = await readUsers();
 
     if (update.callback_query) {
       const cq = update.callback_query;
       const telegramId = cq.from.id;
-      const user = await getOrCreateUser(users, telegramId);
-      await handleCallback(users, user, cq);
+      const user = findOrCreateUser(users, telegramId);
+      await handleCallback(user, cq);
+    } else if (update.message) {
+      const msg = update.message;
+      const chatId = msg.chat.id;
+      const telegramId = msg.from.id;
+      const user = findOrCreateUser(users, telegramId);
+
+      if (msg.document) {
+        const fileText = await downloadFileText(msg.document.file_id);
+        const caption = msg.caption || "";
+        await handleUserContent(user, chatId, [caption, fileText].filter(Boolean).join("\n\n---\n\n"));
+      } else {
+        const text = msg.text || "";
+        if (text) {
+          if (user.state === "awaiting_key") {
+            user.apiKeyEnc = encrypt(text.trim());
+            user.state = null;
+            await sendMessage(chatId, "✅ کلید API با موفقیت ثبت شد: " + maskKey(text.trim()));
+          } else if (text.startsWith("/")) {
+            await handleCommand(user, chatId, text);
+          } else {
+            await handleUserContent(user, chatId, text);
+          }
+        }
+      }
+    } else {
       return;
     }
 
-    const msg = update.message;
-    if (!msg) return;
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const user = await getOrCreateUser(users, telegramId);
-
-    // دریافت فایل متنی (سند)
-    if (msg.document) {
-      const fileText = await downloadFileText(msg.document.file_id);
-      const caption = msg.caption || "";
-      await handleUserContent(users, user, chatId, [caption, fileText].filter(Boolean).join("\n\n---\n\n"));
-      return;
-    }
-
-    const text = msg.text || "";
-    if (!text) return;
-
-    if (user.state === "awaiting_key") {
-      await users.updateOne({ telegramId }, { $set: { apiKey: text.trim(), state: null } });
-      await sendMessage(chatId, "✅ کلید API با موفقیت ثبت شد: " + maskKey(text.trim()));
-      return;
-    }
-
-    if (text.startsWith("/")) {
-      await handleCommand(users, user, chatId, text);
-      return;
-    }
-
-    await handleUserContent(users, user, chatId, text);
+    // نوشتن نهایی وضعیت به‌روزشده در ریپازیتوری داده (یک commit در هر پیام)
+    await writeUsers(users, sha);
   } catch (err) {
     console.error("Webhook error:", err);
   }
